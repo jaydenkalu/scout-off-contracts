@@ -224,20 +224,24 @@ impl ScoutAccessContract {
 
         let now = env.ledger().timestamp();
 
+        // Read the existing subscription exactly once and reuse the single
+        // Option<Subscription> value for all subsequent checks.
+        let existing: Option<Subscription> = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Subscription>(&DataKey::Subscription(scout.clone()));
+        let is_renewal = existing.is_some();
+
         // Downgrade guard: if an active subscription exists, only allow same
         // tier or an upgrade. Downgrades before expiry are rejected.
         // Also enforce a minimum interval between subscribe calls to prevent
         // race conditions / double-charging on rapid upgrades.
-        if let Some(existing) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, Subscription>(&DataKey::Subscription(scout.clone()))
-        {
-            if now <= existing.expires_at {
-                if Self::tier_rank(&tier) < Self::tier_rank(&existing.tier) {
+        if let Some(ref current_sub) = existing {
+            if now <= current_sub.expires_at {
+                if Self::tier_rank(&tier) < Self::tier_rank(&current_sub.tier) {
                     return Err(ScoutAccessError::SubscriptionDowngradeNotAllowed);
                 }
-                let min_next = existing
+                let min_next = current_sub
                     .subscribed_at
                     .checked_add(MIN_UPGRADE_INTERVAL_SECS)
                     .ok_or(ScoutAccessError::Overflow)?;
@@ -246,6 +250,8 @@ impl ScoutAccessContract {
                 }
             }
         }
+        // `is_renewal` is available here for future use (e.g. analytics events).
+        let _ = is_renewal;
 
         let config = Self::fee_config(&env);
         let fee = match &tier {
