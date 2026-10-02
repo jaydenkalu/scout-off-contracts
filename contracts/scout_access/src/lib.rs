@@ -247,7 +247,7 @@ impl ScoutAccessContract {
             }
         }
 
-        let config = Self::fee_config(&env);
+        let config = Self::fee_config(&env)?;
         let fee = match &tier {
             SubscriptionTier::Basic => config.basic_sub_stroops,
             SubscriptionTier::Pro => config.pro_sub_stroops,
@@ -302,7 +302,7 @@ impl ScoutAccessContract {
         let quota_key = DataKey::ContactCount(scout.clone(), month_bucket);
         let current: u32 = env.storage().persistent().get(&quota_key).unwrap_or(0u32);
 
-        let config = Self::fee_config(&env);
+        let config = Self::fee_config(&env)?;
         let limit = config.pro_contact_limit;
 
         if current >= limit {
@@ -335,7 +335,7 @@ impl ScoutAccessContract {
         let quota_key = DataKey::ContactCount(scout.clone(), month_bucket);
         let current: u32 = env.storage().persistent().get(&quota_key).unwrap_or(0u32);
 
-        let config = Self::fee_config(&env);
+        let config = Self::fee_config(&env)?;
         let limit = config.pro_contact_limit;
 
         if current.saturating_add(requested) > limit {
@@ -389,7 +389,7 @@ impl ScoutAccessContract {
             return Err(ScoutAccessError::AlreadyContacted);
         }
 
-        let config = Self::fee_config(&env);
+        let config = Self::fee_config(&env)?;
         Self::collect_fee(&env, &scout, config.contact_fee_stroops)?;
         Self::increment_contact_count(&env, &scout);
 
@@ -441,7 +441,7 @@ impl ScoutAccessContract {
         scout.require_auth();
         Self::require_active_subscription(&env, &scout)?;
 
-        let config = Self::fee_config(&env);
+        let config = Self::fee_config(&env)?;
         let mut new_contacts: u32 = 0;
 
         // First pass: count new (uncharged) contacts to compute total fee.
@@ -625,7 +625,7 @@ impl ScoutAccessContract {
         Ok(sub)
     }
 
-    pub fn get_fee_config(env: Env) -> FeeConfig {
+    pub fn get_fee_config(env: Env) -> Result<FeeConfig, ScoutAccessError> {
         Self::bump_instance_ttl(&env);
         Self::fee_config(&env)
     }
@@ -848,11 +848,14 @@ impl ScoutAccessContract {
         Ok(sub)
     }
 
-    fn fee_config(env: &Env) -> FeeConfig {
+    /// Return the `FeeConfig` from instance storage, or `NotInitialized` when
+    /// absent (uninitialized contract). This is the single accessor used
+    /// everywhere — no ad-hoc `DataKey::FeeConfig` reads are allowed.
+    fn fee_config(env: &Env) -> Result<FeeConfig, ScoutAccessError> {
         env.storage()
             .instance()
             .get(&DataKey::FeeConfig)
-            .expect("fee config not set")
+            .ok_or(ScoutAccessError::NotInitialized)
     }
 
     fn accumulate_fee(env: &Env, amount: i128) -> Result<(), ScoutAccessError> {
@@ -1909,6 +1912,33 @@ assert_eq!(
             env.storage().instance().remove(&DataKey::XlmToken);
         });
         let scout = Address::generate(&env);
+        let result = client.try_subscribe(&scout, &SubscriptionTier::Basic);
+        assert_eq!(result, Err(Ok(ScoutAccessError::NotInitialized)));
+    }
+
+    // -------------------------------------------------------------------------
+    // #1458: fee_config() returns NotInitialized when FeeConfig key is absent
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_get_fee_config_missing_key_returns_not_initialized() {
+        let (env, _admin, _xlm, contract_id, client) = setup();
+        // Remove the FeeConfig key to simulate an uninitialized / expired entry.
+        env.as_contract(&contract_id, || {
+            env.storage().instance().remove(&DataKey::FeeConfig);
+        });
+        let result = client.try_get_fee_config();
+        assert_eq!(result, Err(Ok(ScoutAccessError::NotInitialized)));
+    }
+
+    #[test]
+    fn test_subscribe_missing_fee_config_returns_not_initialized() {
+        let (env, admin, xlm, contract_id, client) = setup();
+        env.as_contract(&contract_id, || {
+            env.storage().instance().remove(&DataKey::FeeConfig);
+        });
+        let scout = Address::generate(&env);
+        mint_token(&env, &xlm, &admin, &scout, 10_000_000);
         let result = client.try_subscribe(&scout, &SubscriptionTier::Basic);
         assert_eq!(result, Err(Ok(ScoutAccessError::NotInitialized)));
     }
