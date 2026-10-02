@@ -351,6 +351,7 @@ impl ScoutAccessContract {
     }
 
     /// Helper: increment contact count by N for Pro tier scouts (batch support).
+    /// The key is TTL-extended on every write so it outlives the subscription.
     fn increment_contact_count_by(env: &Env, scout: &Address, count: u32) {
         const SECONDS_PER_MONTH: u64 = 2_592_000;
         let now = env.ledger().timestamp();
@@ -361,6 +362,10 @@ impl ScoutAccessContract {
         env.storage()
             .persistent()
             .set(&quota_key, &(current.saturating_add(count)));
+        // Extend TTL so the key does not accumulate silently without a deadline.
+        env.storage()
+            .persistent()
+            .extend_ttl(&quota_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
     }
 
     /// Pay a micro-fee to unlock a player's contact details.
@@ -648,6 +653,28 @@ impl ScoutAccessContract {
                 .extend_ttl(&key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
         }
         exists
+    }
+
+    /// Return the number of contacts made by `scout` in the current 30-day
+    /// month bucket (used for Pro tier quota enforcement).
+    /// Returns 0 when no contacts have been recorded yet or the key has expired.
+    pub fn get_contact_count(env: Env, scout: Address) -> u32 {
+        Self::bump_instance_ttl(&env);
+        const SECONDS_PER_MONTH: u64 = 2_592_000;
+        let now = env.ledger().timestamp();
+        let month_bucket = now / SECONDS_PER_MONTH;
+        let key = DataKey::ContactCount(scout.clone(), month_bucket);
+        let count = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(0u32);
+        if count > 0 {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+        }
+        count
     }
 
     /// Return all player_ids contacted by `scout` as an O(1) index lookup.
@@ -1093,6 +1120,34 @@ mod tests {
         assert!(client.has_contacted(&scout, &1u64));
         // elite fee + contact fee
         assert_eq!(client.get_accumulated_fees(), 7_000_000 + 100_000);
+    }
+
+    // -------------------------------------------------------------------------
+    // #1460: ContactCount key is TTL-managed and exposed via get_contact_count
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_get_contact_count_increments_on_pay_to_contact() {
+        let (env, admin, xlm, _contract_id, client) = setup();
+        let scout = Address::generate(&env);
+        mint_token(&env, &xlm, &admin, &scout, 100_000_000);
+
+        // Pro tier scouts have a monthly quota tracked via ContactCount.
+        client.subscribe(&scout, &SubscriptionTier::Pro);
+        assert_eq!(client.get_contact_count(&scout), 0);
+
+        client.pay_to_contact(&scout, &1u64);
+        assert_eq!(client.get_contact_count(&scout), 1);
+
+        client.pay_to_contact(&scout, &2u64);
+        assert_eq!(client.get_contact_count(&scout), 2);
+    }
+
+    #[test]
+    fn test_get_contact_count_zero_for_new_scout() {
+        let (env, _admin, _xlm, _contract_id, client) = setup();
+        let scout = Address::generate(&env);
+        assert_eq!(client.get_contact_count(&scout), 0);
     }
 
     #[test]
